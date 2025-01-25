@@ -2,27 +2,36 @@ import datasets
 import ast
 from ast import Assign, Call, Expr, keyword
 import os
+import re
 from verl.utils.hdfs_io import copy, makedirs
 import argparse
 
 
-def parse_function_call(code_str):
-    """Extract function name and arguments from code string"""
+def extract_code_blocks(content):
+    """Extract all Python code blocks from content, handling markdown and comments"""
+    code_blocks = re.findall(r'```python(.*?)```', content, re.DOTALL)
+    return [cb.strip() for cb in code_blocks if cb.strip()]
+
+
+def parse_function_calls(code_str):
+    """Extract all function calls from a code string"""
     try:
-        code_str = code_str.split("```python")[1].split("```")[0].strip()
         tree = ast.parse(code_str)
-    except:
-        return None, None
+    except SyntaxError:
+        return []
+
+    calls = []
 
     for node in ast.walk(tree):
-        if isinstance(node, Assign) and isinstance(node.value, Call):
-            call = node.value
-        elif isinstance(node, Expr) and isinstance(node.value, Call):
+        if isinstance(node, (Assign, Expr)) and isinstance(getattr(node, 'value', None), Call):
             call = node.value
         else:
             continue
 
-        func_name = call.func.id
+        func_name = getattr(call.func, 'id', None)
+        if not func_name:
+            continue
+
         kwargs = {}
         for kw in call.keywords:
             arg_name = kw.arg
@@ -31,22 +40,36 @@ def parse_function_call(code_str):
                 kwargs[arg_name] = arg_value
             except:
                 continue
-        return func_name, kwargs
 
-    return None, None
+        calls.append((func_name, kwargs))
+
+    return calls
 
 
 def create_reward_entry(example, idx, split):
-    # Extract dialog components
     messages = example["messages"]
-    user_content = next(m["content"] for m in messages if m["role"] == "user")
-    assistant_content = next(m["content"] for m in messages if m["role"] == "assistant")
 
-    # Parse ground truth from assistant response
-    func_name, kwargs = parse_function_call(assistant_content)
-    if not func_name or not kwargs:
-        return None  # Skip malformed entries
+    # Get last user and assistant messages
+    user_messages = [m for m in messages if m["role"] == "user"]
+    assistant_messages = [m for m in messages if m["role"] == "assistant"]
 
+    if not user_messages or not assistant_messages:
+        return None
+
+    user_content = user_messages[-1]["content"]
+    assistant_content = assistant_messages[-1]["content"]
+
+    # Extract and parse all code blocks
+    code_blocks = extract_code_blocks(assistant_content)
+    if not code_blocks:
+        return None
+
+    # Use last code block (most recent correction)
+    all_calls = parse_function_calls(code_blocks[-1])
+    if not all_calls:
+        return None
+
+    # Convert to reward model format
     return {
         "data_source": "fc_merged",
         "prompt": [{"role": "user", "content": user_content}],
@@ -54,14 +77,16 @@ def create_reward_entry(example, idx, split):
         "reward_model": {
             "style": "rule",
             "ground_truth": {
-                "function_name": func_name,
-                "arguments": kwargs
+                "expected_calls": [
+                    {"function": fn, "arguments": args}
+                    for fn, args in all_calls
+                ]
             }
         },
         "extra_info": {
             "split": split,
             "index": idx,
-            "original_assistant_response": assistant_content
+            "original_code_blocks": code_blocks
         }
     }
 
@@ -78,7 +103,8 @@ def main():
         raw_split = dataset[split]
         processed = raw_split.map(
             function=lambda ex, idx: create_reward_entry(ex, idx, split),
-            with_indices=True
+            with_indices=True,
+            remove_columns=raw_split.column_names
         ).filter(lambda x: x is not None)
         return processed
 
